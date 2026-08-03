@@ -12,7 +12,7 @@
   #, glxinfo # unused
   ncurses,
   nodejs,
-  nodePackages,
+  prettier,
   oniguruma,
   parallel,
   pkg-config,
@@ -27,7 +27,6 @@
   wasmtime,
   wraptest,
   zig,
-  zig_0_15,
   zip,
   llvmPackages_latest,
   bzip2,
@@ -60,6 +59,7 @@
   zlib,
   alejandra,
   jq,
+  kaitai-struct-compiler,
   minisign,
   pandoc,
   pinact,
@@ -86,6 +86,11 @@
   gi_typelib_path = import ./build-support/gi-typelib-path.nix {
     inherit pkgs lib stdenv;
   };
+  python = python3.withPackages (python-pkgs: [
+    python-pkgs.blake3
+    python-pkgs.kaitaistruct
+    python-pkgs.ucs-detect
+  ]);
 in
   mkShell {
     name = "ghostty";
@@ -109,7 +114,7 @@ in
         nodejs
 
         # Linting
-        nodePackages.prettier
+        prettier
         alejandra
         pinact
         typos
@@ -117,9 +122,10 @@ in
 
         # Testing
         parallel
-        python3
+        python
         vttest
         hyperfine
+        kaitai-struct-compiler
 
         # wasm
         wabt
@@ -139,11 +145,6 @@ in
         blueprint-compiler
         libadwaita
         gtk4
-
-        # Python packages
-        (python3.withPackages (python-pkgs: [
-          python-pkgs.ucs-detect
-        ]))
       ]
       ++ lib.optionals stdenv.hostPlatform.isLinux [
         # My nix shell environment installs the non-interactive version
@@ -227,8 +228,22 @@ in
         unset SDKROOT
         unset DEVELOPER_DIR
 
+        # AFL++ needs to use the Homebrew/system Apple toolchain directly.
+        # The Nix compiler wrapper variables leak a Nix linker into afl-cc,
+        # which breaks even trivial fuzz harness links on macOS.
+        unset NIX_CC
+        unset NIX_CFLAGS_COMPILE
+        unset NIX_LDFLAGS
+        unset LD
+        unset CC
+        unset CXX
+        unset CFLAGS
+        unset CPPFLAGS
+        unset LDFLAGS
+
         # We need to remove "xcrun" from the PATH. It is injected by
         # some dependency but we need to rely on system Xcode tools
         export PATH=$(echo "$PATH" | awk -v RS=: -v ORS=: '$0 !~ /xcrun/ || $0 == "/usr/bin" {print}' | sed 's/:$//')
+        export PATH="${python}/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/opt/llvm/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
       '');
   }

@@ -153,19 +153,20 @@ const PosixPty = struct {
         // Set CLOEXEC on the master fd, only the slave fd should be inherited
         // by the child process (shell/command).
         cloexec: {
-            const flags = posix.fcntl(master_fd, posix.F.GETFD, 0) catch |err| {
-                log.warn("error getting flags for master fd err={}", .{err});
+            const flags = posix.system.fcntl(master_fd, posix.F.GETFD);
+            if (flags == -1) {
+                log.warn("error getting flags for master fd err=E{s}", .{@tagName(posix.errno(-1))});
                 break :cloexec;
-            };
+            }
 
-            _ = posix.fcntl(
+            switch (posix.errno(posix.system.fcntl(
                 master_fd,
                 posix.F.SETFD,
                 flags | posix.FD_CLOEXEC,
-            ) catch |err| {
-                log.warn("error setting CLOEXEC on master fd err={}", .{err});
-                break :cloexec;
-            };
+            ))) {
+                .SUCCESS => {},
+                else => |e| log.warn("error setting CLOEXEC on master fd err=E{}", .{e}),
+            }
         }
 
         // Enable UTF-8 mode. I think this is on by default on Linux but it
@@ -260,8 +261,8 @@ const PosixPty = struct {
         }
 
         // Can close master/slave pair now
-        posix.close(self.slave);
-        posix.close(self.master);
+        _ = posix.system.close(self.slave);
+        _ = posix.system.close(self.master);
     }
 
     /// Get information about the process(es) attached to the PTY. Returns
@@ -275,9 +276,9 @@ const PosixPty = struct {
                         const linux = std.os.linux;
                         var pgrp: i32 = undefined;
                         const rc = linux.tcgetpgrp(self.master, &pgrp);
-                        switch (linux.E.init(rc)) {
-                            .SUCCESS => return @intCast(pgrp),
-                            else => return null,
+                        switch (rc) {
+                            0 => return @intCast(pgrp), // SUCCESS
+                            else => return null, // Anything else
                         }
                     },
                     else => {
@@ -330,6 +331,7 @@ const WindowsPty = struct {
 
     extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) HMODULE;
     extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+    extern "kernel32" fn GetModuleFileNameW(hModule: HMODULE, lpFilename: [*]u16, nSize: u32) callconv(.winapi) u32;
 
     // Process-wide counter for pipe names
     var pipe_name_counter = std.atomic.Value(u32).init(1);
@@ -340,7 +342,7 @@ const WindowsPty = struct {
     in_pipe: windows.HANDLE,
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
-    pseudo_console: windows.exp.HPCON,
+    pseudo_console: windows.HPCON,
     size: winsize,
 
     const PseudoConsoleApi = struct {
@@ -350,31 +352,22 @@ const WindowsPty = struct {
     };
 
     fn loadAdjacentConptyDll() ?HMODULE {
-        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const exe_path = std.fs.selfExePath(&exe_buf) catch |err| {
-            log.warn("failed to determine executable path for adjacent conpty.dll lookup err={}", .{err});
+        var exe_path_w_buf: [std.fs.max_path_bytes]u16 = undefined;
+        const exe_path_w_len = GetModuleFileNameW(null, &exe_path_w_buf, exe_path_w_buf.len);
+        if (exe_path_w_len == 0) {
+            log.warn("failed to determine executable path for adjacent conpty.dll lookup", .{});
             return null;
-        };
-        const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
+        }
+        const exe_path_w = exe_path_w_buf[0..exe_path_w_len];
 
-        var dll_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dll_path = std.fmt.bufPrint(
-            &dll_path_buf,
-            "{s}\\conpty.dll",
-            .{exe_dir},
-        ) catch |err| {
-            log.warn("failed to build adjacent conpty.dll path err={}", .{err});
-            return null;
-        };
+        const sep_idx = std.mem.lastIndexOfScalar(u16, exe_path_w, '\\') orelse return null;
+        const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\conpty.dll");
 
         var dll_path_w_buf: [std.fs.max_path_bytes]u16 = undefined;
-        const dll_path_w_len = std.unicode.utf8ToUtf16Le(
-            &dll_path_w_buf,
-            dll_path,
-        ) catch |err| {
-            log.warn("failed to encode adjacent conpty.dll path err={}", .{err});
-            return null;
-        };
+        if (sep_idx + suffix.len >= dll_path_w_buf.len) return null;
+        @memcpy(dll_path_w_buf[0..sep_idx], exe_path_w[0..sep_idx]);
+        @memcpy(dll_path_w_buf[sep_idx..][0..suffix.len], suffix);
+        const dll_path_w_len = sep_idx + suffix.len;
         dll_path_w_buf[dll_path_w_len] = 0;
 
         return LoadLibraryW(dll_path_w_buf[0..dll_path_w_len :0].ptr);
@@ -440,10 +433,10 @@ const WindowsPty = struct {
             .lpSecurityDescriptor = null,
         };
 
-        pty.in_pipe = windows.kernel32.CreateNamedPipeW(
+        pty.in_pipe = windows.exp.kernel32.CreateNamedPipeW(
             pipe_path_w.ptr,
             windows.PIPE_ACCESS_OUTBOUND |
-                windows.exp.FILE_FLAG_FIRST_PIPE_INSTANCE |
+                windows.FILE_FLAG_FIRST_PIPE_INSTANCE |
                 windows.FILE_FLAG_OVERLAPPED,
             windows.PIPE_TYPE_BYTE,
             1,
@@ -453,12 +446,12 @@ const WindowsPty = struct {
             &security_attributes,
         );
         if (pty.in_pipe == windows.INVALID_HANDLE_VALUE) {
-            return windows.unexpectedError(windows.kernel32.GetLastError());
+            return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.in_pipe);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe);
 
         var security_attributes_read = security_attributes;
-        pty.in_pipe_pty = windows.kernel32.CreateFileW(
+        pty.in_pipe_pty = windows.exp.kernel32.CreateFileW(
             pipe_path_w.ptr,
             windows.GENERIC_READ,
             0,
@@ -468,9 +461,9 @@ const WindowsPty = struct {
             null,
         );
         if (pty.in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
-            return windows.unexpectedError(windows.kernel32.GetLastError());
+            return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.in_pipe_pty);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe_pty);
 
         // The in_pipe needs to be created as a named pipe, since anonymous
         // pipes created with CreatePipe do not support overlapped operations,
@@ -487,18 +480,30 @@ const WindowsPty = struct {
         //     _ = windows.CloseHandle(pty.in_pipe);
         // }
 
-        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == 0) {
-            return windows.unexpectedError(windows.kernel32.GetLastError());
+        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == windows.FALSE) {
+            return windows.unexpectedError(windows.GetLastError());
         }
         errdefer {
-            _ = windows.CloseHandle(pty.out_pipe);
-            _ = windows.CloseHandle(pty.out_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
+            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
         }
 
-        try windows.SetHandleInformation(pty.in_pipe, windows.HANDLE_FLAG_INHERIT, 0);
-        try windows.SetHandleInformation(pty.in_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
-        try windows.SetHandleInformation(pty.out_pipe, windows.HANDLE_FLAG_INHERIT, 0);
-        try windows.SetHandleInformation(pty.out_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
+        const SetHandleInformation = struct {
+            fn f(hObject: windows.HANDLE) !void {
+                if (windows.exp.kernel32.SetHandleInformation(
+                    hObject,
+                    windows.HANDLE_FLAG_INHERIT,
+                    0,
+                ) == windows.FALSE) {
+                    return windows.unexpectedError(windows.GetLastError());
+                }
+            }
+        };
+
+        try SetHandleInformation.f(pty.in_pipe);
+        try SetHandleInformation.f(pty.in_pipe_pty);
+        try SetHandleInformation.f(pty.out_pipe);
+        try SetHandleInformation.f(pty.out_pipe_pty);
 
         const api = pseudoConsoleApi();
         const result = api.create(
@@ -515,10 +520,10 @@ const WindowsPty = struct {
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.CloseHandle(self.in_pipe_pty);
-        _ = windows.CloseHandle(self.in_pipe);
-        _ = windows.CloseHandle(self.out_pipe_pty);
-        _ = windows.CloseHandle(self.out_pipe);
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
         pseudoConsoleApi().close(self.pseudo_console);
         self.* = undefined;
     }

@@ -347,6 +347,29 @@ pub const Action = union(enum) {
     reset,
 
     /// Copy the selected text to the clipboard.
+    ///
+    /// Valid values:
+    ///
+    ///   - `plain`
+    ///
+    ///     Copy the selection as plain text only.
+    ///
+    ///   - `vt`
+    ///
+    ///     Copy the selection as plain text, preserving terminal escape
+    ///     sequences (such as colors and styles).
+    ///
+    ///   - `html`
+    ///
+    ///     Copy the selection as HTML, preserving colors and styles as
+    ///     HTML markup.
+    ///
+    ///   - `mixed` (default)
+    ///
+    ///     Place multiple representations on the clipboard at once
+    ///     (e.g. plain text and HTML), each tagged with its content type
+    ///     so the receiving OS or application can pick the most appropriate
+    ///     representation when pasting.
     copy_to_clipboard: CopyToClipboard,
 
     /// Paste the contents of the default clipboard.
@@ -398,6 +421,8 @@ pub const Action = union(enum) {
 
     /// Navigate the search results. If there is no active search, this
     /// is not performed.
+    ///
+    /// Valid values: `previous`, `next`.
     navigate_search: NavigateSearch,
 
     /// Start a search if it isn't started already. This doesn't set any
@@ -681,10 +706,21 @@ pub const Action = union(enum) {
     /// of the `confirm-close-surface` configuration setting.
     close_surface,
 
-    /// Close the current tab and all splits therein, close all other tabs, or
-    /// close every tab to the right of the current one depending on the mode.
+    /// Close the specified tabs and all splits therein.
     ///
-    /// If the mode is not specified, defaults to closing the current tab.
+    /// Valid values:
+    ///
+    ///   - `this` (default)
+    ///
+    ///     Close the current tab and all splits within it.
+    ///
+    ///   - `other`
+    ///
+    ///     Close every tab in the current window except the current tab.
+    ///
+    ///   - `right`
+    ///
+    ///     Close every tab to the right of the current tab.
     ///
     /// This might trigger a close confirmation popup, depending on the value
     /// of the `confirm-close-surface` configuration setting.
@@ -1403,30 +1439,35 @@ pub const Action = union(enum) {
         const all_fields = @typeInfo(Action).@"union".fields;
 
         // Find all fields that are app-scoped
-        var i: usize = 0;
-        var union_fields: [all_fields.len]std.builtin.Type.UnionField = undefined;
-        var enum_fields: [all_fields.len]std.builtin.Type.EnumField = undefined;
+        var i: comptime_int = 0;
+        var names: [all_fields.len][]const u8 = undefined;
+        var types: [all_fields.len]type = undefined;
+        var attrs: [all_fields.len]std.builtin.Type.UnionField.Attributes = undefined;
+        var raw_values: [all_fields.len]comptime_int = undefined;
+
         for (all_fields) |field| {
             const action = @unionInit(Action, field.name, undefined);
             if (action.scope() == s) {
-                union_fields[i] = field;
-                enum_fields[i] = .{ .name = field.name, .value = i };
+                names[i] = field.name;
+                types[i] = field.type;
+                attrs[i] = .{ .@"align" = field.alignment };
+                raw_values[i] = i;
                 i += 1;
             }
         }
 
+        const TagInt = std.math.IntFittingRange(0, i);
+        var values: [i]TagInt = undefined;
+        for (raw_values[0..i], &values) |raw, *v| v.* = raw;
+
         // Build our union
-        return @Type(.{ .@"union" = .{
-            .layout = .auto,
-            .tag_type = @Type(.{ .@"enum" = .{
-                .tag_type = std.math.IntFittingRange(0, i),
-                .fields = enum_fields[0..i],
-                .decls = &.{},
-                .is_exhaustive = true,
-            } }),
-            .fields = union_fields[0..i],
-            .decls = &.{},
-        } });
+        return @Union(
+            .auto,
+            @Enum(TagInt, .exhaustive, names[0..i], &values),
+            names[0..i],
+            types[0..i],
+            attrs[0..i],
+        );
     }
 
     /// Returns the scoped version of this action. If the action is not
@@ -2615,9 +2656,8 @@ pub const Set = struct {
     /// Get an entry for the given key event. This will attempt to find
     /// a binding using multiple parts of the event in the following order:
     ///
-    ///   1. Translated key (event.key)
-    ///   2. Physical key (event.physical_key)
-    ///   3. Unshifted Unicode codepoint (event.unshifted_codepoint)
+    ///   1. Physical key (event.physical_key)
+    ///   2. Unshifted Unicode codepoint (event.unshifted_codepoint)
     ///
     pub fn getEvent(self: *const Set, event: KeyEvent) ?Entry {
         var trigger: Trigger = .{

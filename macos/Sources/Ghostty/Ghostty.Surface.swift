@@ -24,6 +24,13 @@ extension Ghostty {
         }
 
         deinit {
+            guard !Thread.isMainThread else {
+                // The surface remains registered with the app and holds unretained
+                // userdata until it is freed. When already on the main thread, free
+                // it synchronously so teardown completes before we disappear.
+                ghostty_surface_free(surface)
+                return
+            }
             // deinit is not guaranteed to happen on the main actor and our API
             // calls into libghostty must happen there so we capture the surface
             // value so we don't capture `self` and then we detach it in a task.
@@ -90,6 +97,21 @@ extension Ghostty {
         @MainActor
         var mouseCaptured: Bool {
             ghostty_surface_mouse_captured(surface)
+        }
+
+        /// The PID of the foreground process group attached to the PTY.
+        @MainActor
+        var foregroundPID: Int? {
+            let pid = ghostty_surface_foreground_pid(surface)
+            guard pid != 0 else { return nil }
+            return Int(exactly: pid)
+        }
+
+        /// The PTY device name for this surface.
+        @MainActor
+        var ttyName: String? {
+            let ttyName = AllocatedString(ghostty_surface_tty_name(surface)).string
+            return ttyName.isEmpty ? nil : ttyName
         }
 
         /// Send a mouse button event to the terminal.

@@ -104,7 +104,7 @@ struct TerminalCommandPaletteView: View {
             badge: updateViewModel.badge,
             emphasis: true
         ) {
-            (NSApp.delegate as? AppDelegate)?.updateController.installUpdate()
+            (NSApp.delegate as? AppDelegate)?.updateController.viewModel.state.confirm()
         })
 
         options.append(CommandOption(

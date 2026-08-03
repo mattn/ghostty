@@ -9,17 +9,17 @@ pub fn build(b: *std.Build) !void {
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
         .linkage = .static,
     });
-    lib.linkLibC();
     if (target.result.os.tag.isDarwin()) {
         const apple_sdk = @import("apple_sdk");
         try apple_sdk.addPaths(b, lib);
     }
 
     if (b.lazyDependency("zlib", .{})) |upstream| {
-        lib.addIncludePath(upstream.path(""));
+        lib.root_module.addIncludePath(upstream.path(""));
         lib.installHeadersDirectory(
             upstream.path(""),
             "",
@@ -33,6 +33,12 @@ pub fn build(b: *std.Build) !void {
             "-DHAVE_STDINT_H",
             "-DHAVE_STDDEF_H",
         });
+        if (target.result.abi == .msvc) {
+            try flags.appendSlice(b.allocator, &.{
+                "-fno-sanitize=undefined",
+                "-fno-sanitize-trap=undefined",
+            });
+        }
         if (target.result.os.tag != .windows) {
             try flags.append(b.allocator, "-DZ_HAVE_UNISTD_H");
         }
@@ -42,7 +48,7 @@ pub fn build(b: *std.Build) !void {
                 "-D_CRT_NONSTDC_NO_DEPRECATE",
             });
         }
-        lib.addCSourceFiles(.{
+        lib.root_module.addCSourceFiles(.{
             .root = upstream.path(""),
             .files = srcs,
             .flags = flags.items,

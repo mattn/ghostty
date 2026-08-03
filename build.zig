@@ -25,9 +25,10 @@ pub fn build(b: *std.Build) !void {
     // use that as the version source of truth. Otherwise we fall back
     // to what is in the build.zig.zon.
     const file_version: ?[]const u8 = if (b.build_root.handle.readFileAlloc(
-        b.allocator,
+        b.graph.io,
         "VERSION",
-        128,
+        b.allocator,
+        .limited(128),
     )) |content| std.mem.trim(
         u8,
         content,
@@ -155,7 +156,11 @@ pub fn build(b: *std.Build) !void {
     // libghostty-vt xcframework (Apple only, universal binary).
     // Only when building on macOS (not cross-compiling) since
     // xcodebuild is required.
-    if (builtin.os.tag.isDarwin() and config.target.result.os.tag.isDarwin()) {
+    if (config.emit_lib_vt and
+        config.emit_xcframework and
+        builtin.os.tag.isDarwin() and
+        config.target.result.os.tag.isDarwin())
+    {
         const apple_libs = try buildpkg.GhosttyLibVt.initStaticAppleUniversal(
             b,
             &config,
@@ -200,8 +205,9 @@ pub fn build(b: *std.Build) !void {
     }
 
     // macOS only artifacts. These will error if they're initialized for
-    // other targets.
-    if (config.target.result.os.tag.isDarwin() and
+    // other targets. In lib-vt mode emit_xcframework controls the lib-vt
+    // xcframework above, not this one.
+    if (!config.emit_lib_vt and config.target.result.os.tag.isDarwin() and
         (config.emit_xcframework or config.emit_macos_app))
     {
         // Ghostty xcframework
@@ -258,7 +264,8 @@ pub fn build(b: *std.Build) !void {
 
         // On macOS we can run the macOS app. For "run" we always force
         // a native-only build so that we can run as quickly as possible.
-        if (config.target.result.os.tag.isDarwin() and
+        if (!config.emit_lib_vt and
+            config.target.result.os.tag.isDarwin() and
             (config.emit_xcframework or config.emit_macos_app))
         {
             const xcframework_native = try buildpkg.GhosttyXCFramework.init(
@@ -292,7 +299,7 @@ pub fn build(b: *std.Build) !void {
         // We need to rebuild Ghostty with a baseline CPU target.
         const valgrind_exe = exe: {
             var valgrind_config = config;
-            valgrind_config.target = valgrind_config.baselineTarget();
+            valgrind_config.target = valgrind_config.baselineTarget(b.graph.io);
             break :exe try buildpkg.GhosttyExe.init(
                 b,
                 &valgrind_config,
@@ -337,7 +344,7 @@ pub fn build(b: *std.Build) !void {
             .filters = test_filters,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
-                .target = config.baselineTarget(),
+                .target = config.baselineTarget(b.graph.io),
                 .optimize = .Debug,
                 .strip = false,
                 .omit_frame_pointer = false,
@@ -346,19 +353,18 @@ pub fn build(b: *std.Build) !void {
             // Crash on x86_64 without this
             .use_llvm = true,
         });
-        if (config.emit_test_exe) b.installArtifact(test_exe);
+        if (config.emit_test_exe) {
+            const test_exe_install = b.addInstallArtifact(test_exe, .{});
+            config.addPatchElf(test_exe, &test_exe_install.step);
+            test_step.dependOn(&test_exe_install.step);
+        }
         _ = try deps.add(test_exe);
 
-        // Verify our internal libghostty header.
-        const ghostty_h = b.addTranslateC(.{
-            .root_source_file = b.path("include/ghostty.h"),
-            .target = config.baselineTarget(),
-            .optimize = .Debug,
-        });
-        test_exe.root_module.addImport("ghostty.h", ghostty_h.createModule());
+        addGhosttyH(b, test_exe.root_module, config.baselineTarget(b.graph.io), .Debug);
 
         // Normal test running
         const test_run = b.addRunArtifact(test_exe);
+        config.addPatchElf(test_exe, &test_run.step);
         test_step.dependOn(&test_run.step);
 
         // Normal tests always test our libghostty modules
@@ -373,6 +379,7 @@ pub fn build(b: *std.Build) !void {
             "--gen-suppressions=all",
         });
         valgrind_run.addArtifactArg(test_exe);
+        config.addPatchElf(test_exe, &valgrind_run.step);
         test_valgrind_step.dependOn(&valgrind_run.step);
     }
 
@@ -383,4 +390,29 @@ pub fn build(b: *std.Build) !void {
     } else {
         try translations_step.addError("cannot update translations when i18n is disabled", .{});
     }
+}
+
+fn addGhosttyH(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+    const translate_c_dep = b.lazyDependency("translate_c", .{}) orelse return;
+
+    const translated: translate_c.Translator = .init(translate_c_dep, .{
+        .c_source_file = b.addWriteFiles().add(
+            "hb_c.h",
+            \\#include <ghostty.h>
+            ,
+        ),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    translated.addSystemIncludePath(b.path("include"));
+
+    module.addImport("ghostty.h", translated.mod);
 }

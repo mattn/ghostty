@@ -178,9 +178,8 @@ add_dependencies(ghostty-vt zig_build_lib_vt)
 # Static
 #
 # On Linux and macOS, the static library is a fat archive that bundles
-# the vendored SIMD dependencies (highway, simdutf, utfcpp). Consumers
-# only need to link libc and libc++ (LLVM's C++ runtime, not GNU
-# libstdc++). Use zig cc, clang, or any toolchain with libc++ support.
+# the vendored SIMD dependencies (highway, simdutf). Consumers
+# only need to link libc.
 #
 # On Windows, the SIMD dependencies are not bundled and must be linked
 # separately.
@@ -349,11 +348,7 @@ function(ghostty_vt_add_target)
     )
     if(_GVT_ZIG_TARGET MATCHES "windows")
         set_target_properties(${_static_target} PROPERTIES
-            INTERFACE_LINK_LIBRARIES "c++;ntdll;kernel32"
-        )
-    else()
-        set_target_properties(${_static_target} PROPERTIES
-            INTERFACE_LINK_LIBRARIES "c++"
+            INTERFACE_LINK_LIBRARIES "ntdll;kernel32"
         )
     endif()
     add_dependencies(${_static_target} ${_build_target})

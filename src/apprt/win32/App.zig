@@ -7,6 +7,7 @@ const App = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const global = @import("../../global.zig");
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
@@ -148,7 +149,7 @@ alloc: Allocator,
 running: bool = true,
 
 /// All top-level windows owned by this app.
-windows: std.ArrayListUnmanaged(*Window) = .{},
+windows: std.ArrayListUnmanaged(*Window) = .empty,
 
 /// The window that currently has focus.
 focused_window: ?*Window = null,
@@ -665,6 +666,7 @@ pub fn performAction(
         },
         .renderer_health => return true,
         .color_change => return true,
+        .selection_changed => return true,
         .pwd => return true,
         .secure_input => return true,
         .initial_size, .cell_size, .size_limit => return true,
@@ -913,6 +915,7 @@ pub fn performAction(
             redrawInspector(self, core.rt_surface);
             return true;
         },
+        .export_terminal_io => return false,
         .set_tab_title => {
             const core = switch (target) {
                 .app => return false,
@@ -961,10 +964,11 @@ pub fn performIpc(
     value: apprt.ipc.Action.Value(action),
 ) !bool {
     var buf: [256]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &buf);
     const stderr = &stderr_writer.interface;
 
     switch (action) {
+        .toggle_quick_terminal => return false,
         .new_window => {
             switch (target) {
                 .class => |class| {
@@ -1172,16 +1176,42 @@ fn shouldDispatchKeyPress(vk: WPARAM, mods: @import("../../input.zig").Mods) boo
 
 fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     return switch (vk) {
-        0x41 => .key_a, 0x42 => .key_b, 0x43 => .key_c, 0x44 => .key_d,
-        0x45 => .key_e, 0x46 => .key_f, 0x47 => .key_g, 0x48 => .key_h,
-        0x49 => .key_i, 0x4A => .key_j, 0x4B => .key_k, 0x4C => .key_l,
-        0x4D => .key_m, 0x4E => .key_n, 0x4F => .key_o, 0x50 => .key_p,
-        0x51 => .key_q, 0x52 => .key_r, 0x53 => .key_s, 0x54 => .key_t,
-        0x55 => .key_u, 0x56 => .key_v, 0x57 => .key_w, 0x58 => .key_x,
-        0x59 => .key_y, 0x5A => .key_z,
-        0x30 => .digit_0, 0x31 => .digit_1, 0x32 => .digit_2, 0x33 => .digit_3,
-        0x34 => .digit_4, 0x35 => .digit_5, 0x36 => .digit_6, 0x37 => .digit_7,
-        0x38 => .digit_8, 0x39 => .digit_9,
+        0x41 => .key_a,
+        0x42 => .key_b,
+        0x43 => .key_c,
+        0x44 => .key_d,
+        0x45 => .key_e,
+        0x46 => .key_f,
+        0x47 => .key_g,
+        0x48 => .key_h,
+        0x49 => .key_i,
+        0x4A => .key_j,
+        0x4B => .key_k,
+        0x4C => .key_l,
+        0x4D => .key_m,
+        0x4E => .key_n,
+        0x4F => .key_o,
+        0x50 => .key_p,
+        0x51 => .key_q,
+        0x52 => .key_r,
+        0x53 => .key_s,
+        0x54 => .key_t,
+        0x55 => .key_u,
+        0x56 => .key_v,
+        0x57 => .key_w,
+        0x58 => .key_x,
+        0x59 => .key_y,
+        0x5A => .key_z,
+        0x30 => .digit_0,
+        0x31 => .digit_1,
+        0x32 => .digit_2,
+        0x33 => .digit_3,
+        0x34 => .digit_4,
+        0x35 => .digit_5,
+        0x36 => .digit_6,
+        0x37 => .digit_7,
+        0x38 => .digit_8,
+        0x39 => .digit_9,
         0x08 => .backspace,
         0x09 => .tab,
         0x0D => .enter,
@@ -1210,9 +1240,18 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
         0xBC => .comma,
         0xBE => .period,
         0xBF => .slash,
-        0x70 => .f1, 0x71 => .f2, 0x72 => .f3, 0x73 => .f4,
-        0x74 => .f5, 0x75 => .f6, 0x76 => .f7, 0x77 => .f8,
-        0x78 => .f9, 0x79 => .f10, 0x7A => .f11, 0x7B => .f12,
+        0x70 => .f1,
+        0x71 => .f2,
+        0x72 => .f3,
+        0x73 => .f4,
+        0x74 => .f5,
+        0x75 => .f6,
+        0x76 => .f7,
+        0x77 => .f8,
+        0x78 => .f9,
+        0x79 => .f10,
+        0x7A => .f11,
+        0x7B => .f12,
         else => .unidentified,
     };
 }
@@ -1474,9 +1513,9 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         0x010D => { // WM_IME_STARTCOMPOSITION
             if (surface.core_surface) |core| {
-                core.renderer_state.mutex.lock();
+                core.renderer_state.mutex.lockUncancelable(global.io());
                 const cursor = core.renderer_state.terminal.screens.active.cursor;
-                core.renderer_state.mutex.unlock();
+                core.renderer_state.mutex.unlock(global.io());
                 const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
                 const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
 

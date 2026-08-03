@@ -104,6 +104,14 @@ class AppDelegate: NSObject,
     /// The current state of the quick terminal.
     private var quickTerminalControllerState: QuickTerminalState = .uninitialized
 
+    /// Whether the quick terminal has already been initialized.
+    var quickControllerInitialized: Bool {
+        if case .initialized = quickTerminalControllerState {
+            return true
+        }
+        return false
+    }
+
     /// Our quick terminal. This starts out uninitialized and only initializes if used.
     var quickController: QuickTerminalController {
         switch quickTerminalControllerState {
@@ -151,8 +159,7 @@ class AppDelegate: NSObject,
     /// Signals
     private var signals: [DispatchSourceSignal] = []
 
-    /// The custom app icon image that is currently in use.
-    @Published private(set) var appIcon: NSImage?
+    private let appIconUpdater = AppIconUpdater()
 
     @MainActor private lazy var menuShortcutManager = Ghostty.MenuShortcutManager()
 
@@ -405,20 +412,7 @@ class AppDelegate: NSObject,
         // If our app says we don't need to confirm, we can exit now.
         if !ghostty.needsConfirmQuit { return .terminateNow }
 
-        // We have some visible window. Show an app-wide modal to confirm quitting.
-        let alert = NSAlert()
-        alert.messageText = "Quit Ghostty?"
-        alert.informativeText = "All terminal sessions will be terminated."
-        alert.addButton(withTitle: "Close Ghostty")
-        alert.addButton(withTitle: "Cancel")
-        alert.alertStyle = .warning
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return .terminateNow
-
-        default:
-            return .terminateCancel
-        }
+        return terminate()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -586,11 +580,11 @@ class AppDelegate: NSObject,
         guard NSApp.mainWindow == nil else { return event }
 
         // If this event as-is would result in a key binding then we send it.
-        if let app = ghostty.app {
+        if let app = ghostty.app, let config = ghostty.config.config {
             var ghosttyEvent = event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)
             let match = (event.characters ?? "").withCString { ptr in
                 ghosttyEvent.text = ptr
-                if !ghostty_app_key_is_binding(app, ghosttyEvent) {
+                if !ghostty_config_key_is_binding(config, ghosttyEvent) {
                     return false
                 }
 
@@ -621,7 +615,7 @@ class AppDelegate: NSObject,
         // Build our event input and call ghostty
         if ghostty_app_key(ghostty, event.ghosttyKeyEvent(GHOSTTY_ACTION_PRESS)) {
             // The key was used so we want to stop it from going to our Mac app
-            Ghostty.logger.debug("local key event handled event=\(event)")
+            Ghostty.logger.debug("local key event handled event=\(event, privacy: .public)")
             return nil
         }
 
@@ -676,7 +670,7 @@ class AppDelegate: NSObject,
     private func requestBadgeAuthorizationAndSet(_ center: UNUserNotificationCenter) {
         center.requestAuthorization(options: [.badge]) { granted, error in
             if let error = error {
-                Self.logger.warning("Error requesting badge authorization: \(error)")
+                Self.logger.warning("Error requesting badge authorization: \(error, privacy: .public)")
                 return
             }
 
@@ -847,13 +841,8 @@ class AppDelegate: NSObject,
     }
 
     private func updateAppIcon(from config: Ghostty.Config) {
-        // Since this is called after `DockTilePlugin` has been running,
-        // clean it up here to trigger a correct update of the current config.
-        UserDefaults.ghostty.removeObject(forKey: "CustomGhosttyIcon")
-        DispatchQueue.global().async {
-            UserDefaults.ghostty.appIcon = AppIcon(config: config)
-            DistributedNotificationCenter.default()
-                .postNotificationName(.ghosttyIconDidChange, object: nil, userInfo: nil, deliverImmediately: true)
+        Task.detached {
+            await self.appIconUpdater.update(icon: AppIcon(config: config))
         }
     }
 
@@ -865,8 +854,6 @@ class AppDelegate: NSObject,
     }
 
     func application(_ app: NSApplication, willEncodeRestorableState coder: NSCoder) {
-        Self.logger.debug("application will save window state")
-
         guard ghostty.config.windowSaveState != "never" else { return }
 
         // Encode our quick terminal state if we have it.
@@ -947,7 +934,7 @@ class AppDelegate: NSObject,
     // MARK: - IB Actions
 
     @IBAction func openConfig(_ sender: Any?) {
-        Ghostty.App.openConfig()
+        ghostty.openConfig()
     }
 
     @IBAction func reloadConfig(_ sender: Any?) {
@@ -1178,6 +1165,7 @@ extension AppDelegate {
         syncMenuShortcut(config, action: "paste_from_selection", menuItem: self.menuPasteSelection)
         syncMenuShortcut(config, action: "select_all", menuItem: self.menuSelectAll)
         syncMenuShortcut(config, action: "start_search", menuItem: self.menuFind)
+        syncMenuShortcut(config, action: "end_search", menuItem: self.menuHideFindBar)
         syncMenuShortcut(config, action: "search_selection", menuItem: self.menuSelectionForFind)
         syncMenuShortcut(config, action: "scroll_to_selection", menuItem: self.menuScrollToSelection)
         syncMenuShortcut(config, action: "navigate_search:next", menuItem: self.menuFindNext)
@@ -1308,6 +1296,79 @@ extension AppDelegate: NSMenuItemValidation {
 
         default:
             return true
+        }
+    }
+}
+
+// MARK: - Termination Flow
+
+extension AppDelegate {
+    func terminate() -> NSApplication.TerminateReply {
+        let controllersNeedConfirmation = NSApplication.shared.windows
+            .compactMap { $0.windowController as? BaseTerminalController }
+            .filter { !$0.windowCanBeClosedWithoutConfirmation() }
+
+        guard !controllersNeedConfirmation.isEmpty else {
+            return .terminateNow
+        }
+
+        if controllersNeedConfirmation.count == 1 {
+            Task {
+                let response = await controllersNeedConfirmation[0].confirmCloseAsync(
+                    messageText: "Quit Ghostty?",
+                    informativeText: "The terminal still has a running process. If you quit, the process will be killed.",
+                    confirmButtonTitle: "Terminate",
+                )
+
+                if [.OK, .alertFirstButtonReturn].contains(response) {
+                    await NSApp.reply(toApplicationShouldTerminate: true)
+                } else {
+                    await NSApp.reply(toApplicationShouldTerminate: false)
+                }
+            }
+
+            return .terminateLater
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "You have \(controllersNeedConfirmation.count) windows with running processes. Do you want to review these windows before quitting?"
+            alert.informativeText = "If you don't review your windows, any running processes will be terminated"
+            alert.addButton(withTitle: "Review Windows...")
+            alert.addButton(withTitle: "Terminate Processes")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                reviewWindows(controllersNeedConfirmation)
+                return .terminateLater
+            case .alertSecondButtonReturn:
+                return .terminateNow
+            default:
+                return .terminateCancel
+            }
+        }
+    }
+
+    private func reviewWindows(_ controllers: [BaseTerminalController]) {
+        Task {
+            for controller in controllers {
+                let response = await controller.confirmCloseAsync(
+                    messageText: "Quit Ghostty?",
+                    informativeText: "The terminal still has a running process. If you quit, the process will be killed.",
+                    confirmButtonTitle: "Terminate",
+                )
+
+                if [.OK, .alertFirstButtonReturn].contains(response) {
+                    // Close this window and until next review is cancelled
+                    await controller.window?.close()
+                    continue
+                } else {
+                    await NSApp.reply(toApplicationShouldTerminate: false)
+                    // Cancel the review
+                    return
+                }
+            }
+            await NSApp.reply(toApplicationShouldTerminate: true)
         }
     }
 }

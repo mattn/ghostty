@@ -64,7 +64,7 @@ fn initInner(
     vt_c_name: []const u8,
 ) !GhosttyZig {
     // Terminal module build options
-    var vt_options = cfg.terminalOptions(.lib);
+    var vt_options = cfg.terminalOptions(.lib, cfg.optimize);
     vt_options.artifact = .lib;
     // We presently don't allow Oniguruma in our Zig module at all.
     // We should expose this as a build option in the future so we can
@@ -119,13 +119,14 @@ fn initVt(
         .target = cfg.target,
         .optimize = cfg.optimize,
 
-        // SIMD require libc/libcpp (both) but otherwise we don't care.
-        // On MSVC, we must not use linkLibCpp because Zig passes
-        // -nostdinc++ and adds its bundled libc++/libc++abi headers
-        // which conflict with MSVC's C++ runtime. The MSVC SDK dirs
-        // added via link_libc contain both C and C++ headers.
+        // SIMD requires libc. Vendored C++ dependencies are built with
+        // no-libcxx mode (HWY_NO_LIBCXX / SIMDUTF_NO_LIBCXX) so we
+        // don't need libcpp. System-provided simdutf headers still
+        // use C++ stdlib headers, so we need libcpp in that case.
         .link_libc = if (cfg.simd) true else null,
-        .link_libcpp = if (cfg.simd and cfg.target.result.abi != .msvc) true else null,
+        .link_libcpp = if (cfg.simd and
+            b.systemIntegrationOption("simdutf", .{}) and
+            cfg.target.result.abi != .msvc) true else null,
     });
     vt.addOptions("build_options", general_options);
     vt_options.add(b, vt);
@@ -134,7 +135,7 @@ fn initVt(
     deps.unicode_tables.addModuleImport(vt);
 
     // We need uucode for grapheme break support
-    deps.addUucode(b, vt, cfg.target, cfg.optimize);
+    vt.addImport("uucode", deps.uucode_mod);
 
     // If SIMD is enabled, add all our SIMD dependencies.
     if (cfg.simd) {
